@@ -1,0 +1,48 @@
+# Note: model checkpoints (.pt files) should be committed via Git LFS or stored separately. See README for download instructions.
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── Colab / Jupyter ───────────────────────────────────────────────────────────
+# Notebooks belong in a separate branch (e.g. notebooks/) or are excluded entirely.
+# Committed notebooks accumulate output cells that bloat git history and create
+# reproducibility issues. Export to .py scripts before committing to main.
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Large model files ─────────────────────────────────────────────────────────
+# Checkpoints should be committed via Git LFS or stored in external storage
+# (Google Drive, HuggingFace Hub, etc.). See README for download instructions.
+*.pt
+*.bin
+*.onnx
+*.tflite
+checkpoints/
+
+# ── Results data ──────────────────────────────────────────────────────────────
+# surprise_traces_phase2.json is too large for direct commit — upload separately
+# (Google Drive or HuggingFace datasets) and link from docs/EXPERIMENT_LOG.md.
+surprise_traces_phase2.json
+# Raw metrics CSVs — use results/*.json instead (structured, versioned).
+*.csv
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+*.key
+wandb/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
