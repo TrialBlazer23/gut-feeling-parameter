@@ -1,0 +1,52 @@
+{
+  "pre_ep": 50,
+  "test_ep": 60,
+  "per_seed": {
+    "42": {
+      "pool_size": 500,
+      "a2_final": 0.7699596560846561,
+      "a3_final": 0.6463688913885764,
+      "a2_convergence_ep": 5,
+      "a3_convergence_ep": 5
+    },
+    "43": {
+      "pool_size": 500,
+      "a2_final": 0.8022060723514212,
+      "a3_final": 0.6209240316946627,
+      "a2_convergence_ep": 5,
+      "a3_convergence_ep": 5
+    },
+    "44": {
+      "pool_size": 500,
+      "a2_final": 0.8804623878536922,
+      "a3_final": 0.6295833333333334,
+      "a2_convergence_ep": 5,
+      "a3_convergence_ep": 5
+    }
+  },
+  "aggregate": {
+    "a2_final_mean": 0.8175427054299232,
+    "a2_final_std": 0.04639772025824357,
+    "a3_final_mean": 0.6322920854721908,
+    "a3_final_std": 0.01056292967009509,
+    "lift_mean": 0.18525061995773232,
+    "lift_std": 0.052040941561098564,
+    "lift_per_seed": [
+      0.12359076469607966,
+      0.18128204065675846,
+      0.25087905452035886
+    ],
+    "pool_size_mean": 500.0,
+    "conv_speedup_mean": 0.0,
+    "conv_speedup_per_seed": [
+      0,
+      0,
+      0
+    ]
+  },
+  "analysis": {
+    "hypothesis_supported": true,
+    "a2_faster_convergence": false,
+    "pool_useful": true
+  }
+}
