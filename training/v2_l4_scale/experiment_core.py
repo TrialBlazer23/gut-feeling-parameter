@@ -838,7 +838,7 @@ def load_checkpoint(
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
-    checkpoint = torch.load(path, map_location=DEVICE)
+    checkpoint = torch.load(path, map_location=DEVICE, weights_only=True)
     agent.load_state_dict_extended(checkpoint["agent_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return int(checkpoint["episode"])
