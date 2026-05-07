@@ -252,6 +252,22 @@ class EpisodicMemory(nn.Module):
         return ctx, dist
 
 
+class ConfigA_Agent(nn.Module):
+    """
+    Supervised Baseline.
+    Trained with BCE loss on threat(2) / normal(0) labels.
+    Precursor labels (1) are completely ignored (withheld).
+    """
+    def __init__(self, window_size: int, cfg: ExperimentConfig):
+        super().__init__()
+        self.encoder = PredictiveEncoder(window_size, cfg.hidden_size, cfg.n_layers)
+        self.window_size = window_size
+        self.cfg = cfg
+
+    def forward(self, obs: torch.Tensor):
+        hidden, pred_next, logits = self.encoder(obs)
+        return hidden, pred_next, logits
+
 class ConfigD_Agent(nn.Module):
     """
     Pure surprise-gated curiosity agent.
@@ -265,7 +281,7 @@ class ConfigD_Agent(nn.Module):
         self.cfg = cfg
         # Running stats for surprise normalization
         self.register_buffer('_err_mean', torch.tensor(0.0))
-        self.register_buffer('_err_var', torch.tensor(1.0))
+        self.register_buffer('_err_M2', torch.tensor(0.0))
         self.register_buffer('_err_count', torch.tensor(0.0))
 
     def _update_running_stats(self, err: float):
@@ -275,13 +291,13 @@ class ConfigD_Agent(nn.Module):
         delta = err - self._err_mean.item()
         self._err_mean += delta / n
         delta2 = err - self._err_mean.item()
-        self._err_var += (delta * delta2 - self._err_var) / n
+        self._err_M2 += delta * delta2
 
     def forward(self, obs: torch.Tensor):
         hidden, pred_next, logits = self.encoder(obs)
         return hidden, pred_next, logits
 
-    def compute_intrinsic_reward(self, pred_next: torch.Tensor, actual_next: float, action: int) -> float:
+    def compute_intrinsic_reward(self, pred_next: torch.Tensor, actual_next: float, action: int) -> Tuple[float, float, bool]:
         """
         reward = 0.5 * normalized_pred_error
         gated by: pred_error > running_mean + 1.0*std AND action == 1
@@ -289,7 +305,8 @@ class ConfigD_Agent(nn.Module):
         pred_err = abs(pred_next.item() - actual_next)
         self._update_running_stats(pred_err)
         mean = self._err_mean.item()
-        std = math.sqrt(max(self._err_var.item(), 1e-8))
+        var = self._err_M2.item() / max(self._err_count.item() - 1, 1.0)
+        std = math.sqrt(max(var, 1e-8))
         normalized = (pred_err - mean) / (std + 1e-8)
         threshold_exceeded = pred_err > (mean + self.cfg.surprise_gate_std_mult * std)
         if threshold_exceeded and action == 1:
@@ -316,7 +333,7 @@ class ConfigE_Agent(nn.Module):
             nn.Linear(cfg.hidden_size // 2, 2)
         )
         self.register_buffer('_err_mean', torch.tensor(0.0))
-        self.register_buffer('_err_var', torch.tensor(1.0))
+        self.register_buffer('_err_M2', torch.tensor(0.0))
         self.register_buffer('_err_count', torch.tensor(0.0))
 
     def _update_running_stats(self, err: float):
@@ -325,7 +342,7 @@ class ConfigE_Agent(nn.Module):
         delta = err - self._err_mean.item()
         self._err_mean += delta / n
         delta2 = err - self._err_mean.item()
-        self._err_var += (delta * delta2 - self._err_var) / n
+        self._err_M2 += delta * delta2
 
     def forward(self, obs: torch.Tensor, write_label: Optional[int] = None):
         hidden, pred_next, _ = self.encoder(obs)
@@ -343,7 +360,8 @@ class ConfigE_Agent(nn.Module):
         pred_err = abs(pred_next.item() - actual_next)
         self._update_running_stats(pred_err)
         mean = self._err_mean.item()
-        std = math.sqrt(max(self._err_var.item(), 1e-8))
+        var = self._err_M2.item() / max(self._err_count.item() - 1, 1.0)
+        std = math.sqrt(max(var, 1e-8))
         normalized = (pred_err - mean) / (std + 1e-8)
         threshold_exceeded = pred_err > (mean + self.cfg.surprise_gate_std_mult * std)
         if threshold_exceeded and action == 1:
@@ -365,11 +383,13 @@ def run_episode(agent, env: SignalEnvironment, optimizer: optim.Optimizer,
                 cfg: ExperimentConfig, config_name: str, train: bool = True) -> Dict:
     """
     Run one episode. Returns metrics dict.
-    Handles both ConfigD_Agent and ConfigE_Agent polymorphically.
+    Handles ConfigA, ConfigD, and ConfigE agents polymorphically.
     """
     obs, labels = env.reset()
     is_config_e = isinstance(agent, ConfigE_Agent)
+    is_config_a = isinstance(agent, ConfigA_Agent)
     log_probs, rewards, pred_errors = [], [], []
+    a_losses = []
     surprise_events = []  # (step_idx, pred_error, true_label, action)
     action_counts = {0: 0, 1: 0}
     precursor_detected = 0
@@ -389,9 +409,16 @@ def run_episode(agent, env: SignalEnvironment, optimizer: optim.Optimizer,
 
         probs = F.softmax(logits, dim=-1)
         dist = torch.distributions.Categorical(probs)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        action_val = action.item()
+
+        if is_config_a and not train:
+            # Action at eval time is argmax of logits for supervised agent
+            action_val = torch.argmax(logits, dim=-1).item()
+            log_prob = torch.tensor(0.0) # Not used
+        else:
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            action_val = action.item()
+
         action_counts[action_val] += 1
 
         # Store hidden state for linear probe
@@ -410,9 +437,17 @@ def run_episode(agent, env: SignalEnvironment, optimizer: optim.Optimizer,
             if action_val == 1:
                 threat_detected += 1
 
-        # Intrinsic reward
+        # Intrinsic reward and supervised loss
         actual_next = float(next_obs[-1]) if len(next_obs) > 0 else 0.0
-        reward, pred_err, is_surprise = agent.compute_intrinsic_reward(pred_next, actual_next, action_val)
+        if is_config_a:
+            reward, pred_err, is_surprise = 0.0, 0.0, False
+            if train:
+                if true_label == 0:
+                    a_losses.append(F.cross_entropy(logits, torch.tensor([0]).to(DEVICE)))
+                elif true_label == 2:
+                    a_losses.append(F.cross_entropy(logits, torch.tensor([1]).to(DEVICE)))
+        else:
+            reward, pred_err, is_surprise = agent.compute_intrinsic_reward(pred_next, actual_next, action_val)
 
         if is_surprise:
             surprise_events.append({
@@ -437,21 +472,30 @@ def run_episode(agent, env: SignalEnvironment, optimizer: optim.Optimizer,
         if done:
             break
 
-    # REINFORCE update
-    if train and sum(abs(r) for r in rewards) > 1e-8:
-        returns = compute_returns(rewards, cfg.gamma)
-        returns_t = torch.FloatTensor(returns).to(DEVICE)
-        # Normalize returns
-        if returns_t.std() > 1e-8:
-            returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
-        policy_loss = -sum(lp * r for lp, r in zip(log_probs, returns_t))
-        # Entropy bonus
-        entropy = -sum(lp * torch.exp(lp) for lp in log_probs) / len(log_probs)
-        loss = policy_loss - cfg.entropy_coef * entropy
-        optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
-        optimizer.step()
+    if train:
+        if is_config_a:
+            if len(a_losses) > 0:
+                loss = torch.stack(a_losses).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+                optimizer.step()
+        else:
+            # REINFORCE update
+            if sum(abs(r) for r in rewards) > 1e-8:
+                returns = compute_returns(rewards, cfg.gamma)
+                returns_t = torch.FloatTensor(returns).to(DEVICE)
+                # Normalize returns
+                if returns_t.std() > 1e-8:
+                    returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
+                policy_loss = -sum(lp * r for lp, r in zip(log_probs, returns_t))
+                # Entropy bonus
+                entropy = -sum(lp * torch.exp(lp) for lp in log_probs) / len(log_probs)
+                loss = policy_loss - cfg.entropy_coef * entropy
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+                optimizer.step()
 
     mean_err = float(np.mean(pred_errors)) if pred_errors else 0.0
     precursor_det_rate = precursor_detected / max(precursor_total, 1)
@@ -459,15 +503,16 @@ def run_episode(agent, env: SignalEnvironment, optimizer: optim.Optimizer,
     surprise_rate = len(surprise_events) / max(step, 1)
     nonzero_reward_rate = sum(1 for r in rewards if r > 0) / max(step, 1)
 
+    # Convert numeric types to avoid memory leaks
     return {
         "config": config_name,
-        "precursor_det_rate": precursor_det_rate,
-        "threat_det_rate": threat_det_rate,
-        "surprise_rate": surprise_rate,
-        "mean_pred_error": mean_err,
-        "nonzero_reward_rate": nonzero_reward_rate,
-        "action_rate": action_counts[1] / max(step, 1),
-        "n_surprise_events": len(surprise_events),
+        "precursor_det_rate": float(precursor_det_rate),
+        "threat_det_rate": float(threat_det_rate),
+        "surprise_rate": float(surprise_rate),
+        "mean_pred_error": float(mean_err),
+        "nonzero_reward_rate": float(nonzero_reward_rate),
+        "action_rate": float(action_counts[1] / max(step, 1)),
+        "n_surprise_events": int(len(surprise_events)),
         "surprise_events": surprise_events,
         "hidden_states": all_hidden_states,
         "true_labels": all_true_labels,
@@ -479,7 +524,9 @@ def train_config(config_name: str, seed: int, cfg: ExperimentConfig,
     set_seed(seed)
     env = SignalEnvironment(env_cfg, seed=seed)
 
-    if config_name == "D":
+    if config_name == "A":
+        agent = ConfigA_Agent(env_cfg.window_size, cfg).to(DEVICE)
+    elif config_name == "D":
         agent = ConfigD_Agent(env_cfg.window_size, cfg).to(DEVICE)
     elif config_name == "E":
         agent = ConfigE_Agent(env_cfg.window_size, cfg).to(DEVICE)
@@ -522,6 +569,9 @@ def train_config(config_name: str, seed: int, cfg: ExperimentConfig,
     with torch.no_grad():
         final_metrics = run_episode(agent, env, optimizer, cfg, config_name, train=False)
 
+    # Clean up optimizer here before deleting agent in the main loop
+    del optimizer
+
     return episode_metrics, agent, final_metrics
 
 
@@ -530,15 +580,15 @@ print("Training functions defined.")
 # %% ─── CELL 6 — MAIN TRAINING RUN ───────────────────────────────────────────
 
 print("=" * 60)
-print("PHASE 2 TRAINING — Configs D and E")
+print("PHASE 2 TRAINING — Configs A, D, and E")
 print(f"Seeds: {EXP_CFG.n_seeds}  |  Episodes: {EXP_CFG.n_episodes}  |  Hidden: {EXP_CFG.hidden_size}")
 print("=" * 60)
 
-all_results = {"D": {}, "E": {}}
-final_agents = {"D": {}, "E": {}}
-final_metrics_all = {"D": {}, "E": {}}
+all_results = {"A": {}, "D": {}, "E": {}}
+final_agents = {"A": {}, "D": {}, "E": {}}
+final_metrics_all = {"A": {}, "D": {}, "E": {}}
 
-for config_name in ["D", "E"]:
+for config_name in ["A", "D", "E"]:
     print(f"\n{'─'*40}")
     print(f"Training Config {config_name}")
     print(f"{'─'*40}")
@@ -553,7 +603,72 @@ for config_name in ["D", "E"]:
         print(f"  Seed {seed} complete in {elapsed:.1f}s | "
               f"final prec_det={ep_metrics[-1]['precursor_det_rate']:.3f}")
 
+        # Explicit VRAM memory management
+        # We don't need to save the full agent in memory because we have checkpoints.
+        # So we delete agent and optimizer here. But we need to keep fin_metrics
+        # (which has hidden states) for linear probe.
+        del agent
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 print("\nAll training complete.")
+
+# %% ─── CELL 6.5 — RANDOM BASELINE ───────────────────────────────────────────
+
+print("\n" + "=" * 60)
+print("RUNNING RANDOM BASELINE")
+print("=" * 60)
+
+class RandomAgent:
+    def act(self):
+        # 50% probability of action == 1
+        return 1 if random.random() < 0.5 else 0
+
+random_metrics = []
+set_seed(42)
+env = SignalEnvironment(ENV_CFG, seed=42)
+rand_agent = RandomAgent()
+
+for ep in range(20):
+    obs, labels = env.reset()
+    precursor_detected = 0
+    precursor_total = 0
+    action_1_count = 0
+    step = 0
+    while True:
+        action_val = rand_agent.act()
+        if action_val == 1:
+            action_1_count += 1
+
+        next_obs, true_label, done = env.step(action_val)
+
+        if true_label == 1:
+            precursor_total += 1
+            if action_val == 1:
+                precursor_detected += 1
+
+        step += 1
+        if done:
+            break
+
+    random_metrics.append({
+        "precursor_det_rate": precursor_detected / max(precursor_total, 1),
+        "action_rate": action_1_count / max(step, 1)
+    })
+
+mean_rand_prec = np.mean([m["precursor_det_rate"] for m in random_metrics])
+mean_rand_act = np.mean([m["action_rate"] for m in random_metrics])
+
+print(f"\nRandom Baseline (20 episodes):")
+print(f"  Mean precursor detection rate: {mean_rand_prec:.4f}")
+print(f"  Mean action rate: {mean_rand_act:.4f}")
+
+# Save random baseline
+with open("/content/results/random_baseline.json", "w") as f:
+    json.dump({
+        "mean_precursor_det_rate": float(mean_rand_prec),
+        "mean_action_rate": float(mean_rand_act)
+    }, f, indent=2)
 
 # %% ─── CELL 7 — STATISTICAL ANALYSIS (Welch t-test + Cohen's d) ─────────────
 
@@ -578,25 +693,40 @@ metrics_to_test = ["precursor_det_rate", "threat_det_rate", "surprise_rate", "no
 stat_results = {}
 
 for metric in metrics_to_test:
+    a_vals = np.array([get_final_n_ep_mean(all_results, "A", s, metric) for s in EXP_CFG.n_seeds])
     d_vals = np.array([get_final_n_ep_mean(all_results, "D", s, metric) for s in EXP_CFG.n_seeds])
     e_vals = np.array([get_final_n_ep_mean(all_results, "E", s, metric) for s in EXP_CFG.n_seeds])
 
-    t_stat, p_val = stats.ttest_ind(d_vals, e_vals, equal_var=False)
-    d_effect = cohens_d(e_vals, d_vals)  # positive = E > D
+    # Primary comparison: D vs A (Hypothesis 1)
+    t_stat_DA, p_val_DA = stats.ttest_ind(d_vals, a_vals, equal_var=False)
+    d_effect_DA = cohens_d(d_vals, a_vals)  # positive = D > A
+
+    # Secondary comparison: E vs D
+    t_stat_ED, p_val_ED = stats.ttest_ind(e_vals, d_vals, equal_var=False)
+    d_effect_ED = cohens_d(e_vals, d_vals)  # positive = E > D
 
     stat_results[metric] = {
+        "A_mean": float(a_vals.mean()), "A_std": float(a_vals.std()),
         "D_mean": float(d_vals.mean()), "D_std": float(d_vals.std()),
         "E_mean": float(e_vals.mean()), "E_std": float(e_vals.std()),
-        "t_stat": float(t_stat), "p_val": float(p_val),
-        "cohens_d": float(d_effect),
-        "significant": p_val < 0.05
+        "t_stat_DA": float(t_stat_DA), "p_val_DA": float(p_val_DA),
+        "cohens_d_DA": float(d_effect_DA),
+        "significant_DA": p_val_DA < 0.05,
+        "t_stat_ED": float(t_stat_ED), "p_val_ED": float(p_val_ED),
+        "cohens_d_ED": float(d_effect_ED),
+        "significant_ED": p_val_ED < 0.05
     }
 
-    sig = "*** p<0.05 ***" if p_val < 0.05 else "ns"
+    sig_DA = "*** p<0.05 ***" if p_val_DA < 0.05 else "ns"
+    sig_ED = "*** p<0.05 ***" if p_val_ED < 0.05 else "ns"
     print(f"\n{metric}:")
+    print(f"  A: {a_vals.mean():.4f} ± {a_vals.std():.4f}")
     print(f"  D: {d_vals.mean():.4f} ± {d_vals.std():.4f}")
     print(f"  E: {e_vals.mean():.4f} ± {e_vals.std():.4f}")
-    print(f"  Welch t={t_stat:.3f}, p={p_val:.4f}  Cohen's d={d_effect:.3f}  {sig}")
+    if metric == "precursor_det_rate":
+        print(f"  Random Floor: {mean_rand_prec:.4f}")
+    print(f"  [D vs A] Welch t={t_stat_DA:.3f}, p={p_val_DA:.4f}  Cohen's d={d_effect_DA:.3f}  {sig_DA}")
+    print(f"  [E vs D] Welch t={t_stat_ED:.3f}, p={p_val_ED:.4f}  Cohen's d={d_effect_ED:.3f}  {sig_ED}")
 
 # Save stats
 with open("/content/results/statistical_analysis.json", "w") as f:
@@ -606,10 +736,15 @@ print("\nStats saved to /content/results/statistical_analysis.json")
 
 # Primary success check
 prec_stat = stat_results["precursor_det_rate"]
-if prec_stat["significant"] and prec_stat["E_mean"] > prec_stat["D_mean"]:
-    print("\n[SUCCESS] Config E significantly outperforms Config D on precursor detection (p < 0.05)")
-elif prec_stat["p_val"] > 0.05:
-    print(f"\n[NOTE] Config E does not significantly outperform D on precursor detection (p={prec_stat['p_val']:.4f})")
+if prec_stat["significant_DA"] and prec_stat["D_mean"] > prec_stat["A_mean"]:
+    print("\n[SUCCESS] Config D significantly outperforms Config A on precursor detection (p < 0.05) - H1 Supported")
+else:
+    print(f"\n[FAILURE] Config D does NOT significantly outperform Config A on precursor detection (p={prec_stat['p_val_DA']:.4f})")
+
+if prec_stat["significant_ED"] and prec_stat["E_mean"] > prec_stat["D_mean"]:
+    print("[SUCCESS] Config E significantly outperforms Config D on precursor detection (p < 0.05)")
+else:
+    print(f"[NOTE] Config E does not significantly outperform D on precursor detection (p={prec_stat['p_val_ED']:.4f})")
     print("  This is expected if memory needs longer warm-up. Consider N_EPS=300 or memory pre-population.")
 
 # %% ─── CELL 8 — SURPRISE TRACE ANALYSIS ────────────────────────────────────
@@ -675,7 +810,7 @@ probe_results = {}
 for config_name in ["D", "E"]:
     config_accs = []
     for seed in EXP_CFG.n_seeds:
-        agent = final_agents[config_name][seed]
+        # Re-load agent to get properties if needed, but linear probe doesn't need the agent
         fin = final_metrics_all[config_name][seed]
         hidden_states = np.array(fin["hidden_states"])   # (T, hidden_size)
         true_labels = np.array(fin["true_labels"])        # (T,)

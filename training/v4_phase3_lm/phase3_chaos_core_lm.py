@@ -561,6 +561,9 @@ lc_model.save_pretrained(f"{OUT_DIR}/logic_core")
 tokenizer.save_pretrained(f"{OUT_DIR}/logic_core")
 print(f"Logic Core saved to {OUT_DIR}/logic_core")
 
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
 # %% ─── CELL 9 — TRAIN CHAOS CORE ────────────────────────────────────────────
 
 print("\n" + "=" * 60)
@@ -585,6 +588,9 @@ cc_model, cc_losses = train_language_model(
 cc_model.save_pretrained(f"{OUT_DIR}/chaos_core")
 tokenizer.save_pretrained(f"{OUT_DIR}/chaos_core")
 print(f"Chaos Core saved to {OUT_DIR}/chaos_core")
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 # Print reward density summary
 print(f"\nChaos Core reward stats:")
@@ -760,6 +766,10 @@ for epoch in range(CFG.arbiter_epochs):
 
 torch.save(arbiter.state_dict(), f"{OUT_DIR}/arbiter.pt")
 print(f"Arbiter saved to {OUT_DIR}/arbiter.pt")
+
+del arb_optimizer
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 # %% ─── CELL 11 — GFP EVALUATION ON BIG-BENCH HARD ──────────────────────────
 
