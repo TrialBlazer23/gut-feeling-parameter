@@ -375,10 +375,10 @@ class ConfigA_Agent(LSTMAgent):
         obs: np.ndarray,
         info: dict,
         optimizer: optim.Optimizer,
-    ) -> Tuple[int, float]:
+    ) -> Tuple[int, float, float]:
         """
         Forward pass + supervised update.
-        Returns (action, loss).
+        Returns (action, loss, pred_error).
         """
         obs_t = self.obs_to_tensor(obs)
         pred_error = self.compute_pred_error(obs_t.squeeze(0).squeeze(0))
@@ -400,7 +400,7 @@ class ConfigA_Agent(LSTMAgent):
         with torch.no_grad():
             prob = torch.sigmoid(logit).item()
         action = int(prob > 0.5)
-        return action, loss.item()
+        return action, loss.item(), pred_error
 
 
 # ---------------------------------------------------------------------------
@@ -666,58 +666,43 @@ def _run_episode_A(
     obs: np.ndarray,
     m: dict,
 ):
-    for _ in range(cfg.episode_steps):
-        action, loss = agent.step_supervised(obs, {"is_threat": False}, optimizer) if not train else (0, 0.0)
-        # Properly call with info only when training
-        if train:
-            # We need to know is_threat for supervision — peek at current state before step
-            # We use a two-phase approach: step the env first to get info, then update
-            next_obs, info = env.step(0)  # dummy action to get state info
-            # Redo forward pass with actual obs + state info for supervised update
-            action, loss = agent.step_supervised(obs, info, optimizer)
-            _accumulate_step_metrics(m, action, info)
-            obs = next_obs
-        else:
-            action, _ = agent.step_supervised(obs, {"is_threat": False}, optimizer)
-            next_obs, info = env.step(action)
-            _accumulate_step_metrics(m, action, info)
-            obs = next_obs
-        m["pred_errors"].append(0.0)
-
-
-def _run_episode_A(
-    agent: ConfigA_Agent,
-    env: SignalEnvironment,
-    optimizer: optim.Optimizer,
-    cfg: EnvironmentConfig,
-    train: bool,
-    obs: np.ndarray,
-    m: dict,
-):
     """
     Config A inner loop.
-    We interleave forward pass and environment step so the supervised
+    Interleaves forward pass and environment step so the supervised
     label (info["is_threat"]) is available before the gradient update.
     """
     for _ in range(cfg.episode_steps):
-        obs_t = agent.obs_to_tensor(obs)
-        pred_error = agent.compute_pred_error(obs_t.squeeze(0).squeeze(0))
-        m["pred_errors"].append(pred_error)
-
-        # Forward without update to get action first, then get env label
-        with torch.no_grad():
-            _, pred_no_grad, logit_no_grad = agent.forward(obs_t)
-        # Restore hx — forward already updated it; we'll redo inside step_supervised
-        # Save hx before the no-grad forward
-        # Simpler: just use the logit from no-grad for action, then do supervised step
-        prob = torch.sigmoid(logit_no_grad).item()
-        action = int(prob > 0.5)
-
-        next_obs, info = env.step(action)
-
         if train:
+            # To avoid advancing LSTM state twice, save hx before no-grad forward
+            old_hx = (agent.hx[0].detach().clone(), agent.hx[1].detach().clone())
+            obs_t = agent.obs_to_tensor(obs)
+
+            with torch.no_grad():
+                _, _, logit_no_grad = agent.forward(obs_t)
+            prob = torch.sigmoid(logit_no_grad).item()
+            action = int(prob > 0.5)
+
+            # Restore hx for the actual step_supervised call
+            agent.hx = old_hx
+            next_obs, info = env.step(action)
+
             # Supervised update using ground truth label
-            _, _ = agent.step_supervised(obs, info, optimizer)
+            _, _, pred_error = agent.step_supervised(obs, info, optimizer)
+            m["pred_errors"].append(pred_error)
+        else:
+            # Inference: single forward pass, no gradient update
+            obs_t = agent.obs_to_tensor(obs)
+            pred_error = agent.compute_pred_error(obs_t.squeeze(0).squeeze(0))
+            m["pred_errors"].append(pred_error)
+
+            with torch.no_grad():
+                _, pred, logit = agent.forward(obs_t)
+            agent.store_prediction(pred)
+            agent.hx = tuple(h.detach() for h in agent.hx)
+
+            prob = torch.sigmoid(logit).item()
+            action = int(prob > 0.5)
+            next_obs, info = env.step(action)
 
         _accumulate_step_metrics(m, action, info)
         obs = next_obs
