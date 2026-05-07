@@ -581,11 +581,11 @@ def train_config(config_name: str, seed: int, cfg: ExperimentConfig,
 
     eval_metrics = []
     for eval_idx in range(cfg.n_eval_episodes):
-        eval_env = SignalEnvironment(env_cfg, seed=seed * cfg.eval_seed_offset + eval_idx)
+        eval_env = SignalEnvironment(env_cfg, seed=seed + cfg.eval_seed_offset + eval_idx)
         with torch.no_grad():
             eval_metrics.append(
                 run_episode(
-                    agent, eval_env, optimizer, cfg, config_name,
+                    agent, eval_env, None, cfg, config_name,
                     train=False, collect_diagnostics=False
                 )
             )
