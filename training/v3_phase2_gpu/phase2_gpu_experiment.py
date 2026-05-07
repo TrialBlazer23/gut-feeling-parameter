@@ -92,6 +92,7 @@ class ExperimentConfig:
     checkpoint_every: int = 50
     log_every: int = 10
     n_eval_episodes: int = 20
+    eval_seed_offset: int = 1000
 
 ENV_CFG = EnvironmentConfig()
 EXP_CFG = ExperimentConfig()
@@ -256,7 +257,7 @@ class EpisodicMemory(nn.Module):
 class ConfigA_Agent(nn.Module):
     """
     Supervised Baseline.
-    Trained with cross-entropy loss on threat(2) / normal(0) labels.
+    Trained with cross-entropy loss where normal(0) → class 0 and threat(2) → class 1.
     Precursor labels (1) are completely ignored (withheld).
     """
     def __init__(self, window_size: int, cfg: ExperimentConfig):
@@ -264,6 +265,8 @@ class ConfigA_Agent(nn.Module):
         self.encoder = PredictiveEncoder(window_size, cfg.hidden_size, cfg.n_layers)
         self.window_size = window_size
         self.cfg = cfg
+        self.register_buffer("target_normal", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("target_threat", torch.ones(1, dtype=torch.long))
 
     def forward(self, obs: torch.Tensor):
         hidden, pred_next, logits = self.encoder(obs)
@@ -401,9 +404,6 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
     threat_total = 0
     all_hidden_states = []
     all_true_labels = []
-    if is_config_a and train:
-        target_normal = torch.zeros(1, dtype=torch.long, device=DEVICE)
-        target_threat = torch.ones(1, dtype=torch.long, device=DEVICE)
     step = 0
 
     while True:
@@ -451,9 +451,9 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
             reward, pred_err, is_surprise = 0.0, 0.0, False
             if train:
                 if true_label == 0:
-                    a_losses.append(F.cross_entropy(logits, target_normal))
+                    a_losses.append(F.cross_entropy(logits, agent.target_normal))
                 elif true_label == 2:
-                    a_losses.append(F.cross_entropy(logits, target_threat))
+                    a_losses.append(F.cross_entropy(logits, agent.target_threat))
         else:
             reward, pred_err, is_surprise = agent.compute_intrinsic_reward(pred_next, actual_next, action_val)
 
@@ -581,7 +581,7 @@ def train_config(config_name: str, seed: int, cfg: ExperimentConfig,
 
     eval_metrics = []
     for eval_idx in range(cfg.n_eval_episodes):
-        eval_env = SignalEnvironment(env_cfg, seed=seed * 1000 + eval_idx)
+        eval_env = SignalEnvironment(env_cfg, seed=seed * cfg.eval_seed_offset + eval_idx)
         with torch.no_grad():
             eval_metrics.append(
                 run_episode(
