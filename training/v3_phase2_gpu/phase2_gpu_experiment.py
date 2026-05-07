@@ -91,8 +91,8 @@ class ExperimentConfig:
     # Checkpoint / logging
     checkpoint_every: int = 50
     log_every: int = 10
-    n_eval_episodes: int = 20
-    eval_seed_offset: int = 1000
+    n_eval_episodes: int = 20          # Eval episodes per seed for hypothesis-test metrics
+    eval_seed_offset: int = 1000       # Offset so eval RNG streams differ from training streams
 
 ENV_CFG = EnvironmentConfig()
 EXP_CFG = ExperimentConfig()
@@ -265,8 +265,6 @@ class ConfigA_Agent(nn.Module):
         self.encoder = PredictiveEncoder(window_size, cfg.hidden_size, cfg.n_layers)
         self.window_size = window_size
         self.cfg = cfg
-        self.register_buffer("target_normal", torch.zeros(1, dtype=torch.long))
-        self.register_buffer("target_threat", torch.ones(1, dtype=torch.long))
 
     def forward(self, obs: torch.Tensor):
         hidden, pred_next, logits = self.encoder(obs)
@@ -389,6 +387,7 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
     """
     Run one episode. Returns metrics dict.
     Handles ConfigA, ConfigD, and ConfigE agents polymorphically.
+    collect_diagnostics=False skips per-step trace capture to reduce memory use.
     """
     obs, labels = env.reset()
     is_config_e = isinstance(agent, ConfigE_Agent)
@@ -404,6 +403,9 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
     threat_total = 0
     all_hidden_states = []
     all_true_labels = []
+    if is_config_a and train:
+        target_normal = torch.tensor([0], dtype=torch.long, device=DEVICE)
+        target_threat = torch.tensor([1], dtype=torch.long, device=DEVICE)
     step = 0
 
     while True:
@@ -451,9 +453,9 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
             reward, pred_err, is_surprise = 0.0, 0.0, False
             if train:
                 if true_label == 0:
-                    a_losses.append(F.cross_entropy(logits, agent.target_normal))
+                    a_losses.append(F.cross_entropy(logits, target_normal))
                 elif true_label == 2:
-                    a_losses.append(F.cross_entropy(logits, agent.target_threat))
+                    a_losses.append(F.cross_entropy(logits, target_threat))
         else:
             reward, pred_err, is_surprise = agent.compute_intrinsic_reward(pred_next, actual_next, action_val)
 
@@ -531,6 +533,7 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
 
 def train_config(config_name: str, seed: int, cfg: ExperimentConfig,
                  env_cfg: EnvironmentConfig) -> Tuple[List[Dict], nn.Module, Dict, Dict]:
+    """Train one config/seed and return episode metrics, trained agent, final diagnostics, and eval summary."""
     set_seed(seed)
     env = SignalEnvironment(env_cfg, seed=seed)
 
