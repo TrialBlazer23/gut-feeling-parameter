@@ -11,7 +11,7 @@
 
 # %% ─── CELL 1 — INSTALLS & IMPORTS ─────────────────────────────────────────
 
-!pip install -q torch torchvision scikit-learn matplotlib seaborn scipy
+# !pip install -q torch torchvision scikit-learn matplotlib seaborn scipy
 
 import os
 import json
@@ -52,9 +52,9 @@ print(f"PyTorch: {torch.__version__}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-os.makedirs("/content/checkpoints", exist_ok=True)
-os.makedirs("/content/plots", exist_ok=True)
-os.makedirs("/content/results", exist_ok=True)
+os.makedirs("./checkpoints", exist_ok=True)
+os.makedirs("./plots", exist_ok=True)
+os.makedirs("./results", exist_ok=True)
 
 # %% ─── CELL 2 — ENVIRONMENT CONFIG ─────────────────────────────────────────
 
@@ -222,7 +222,9 @@ class EpisodicMemory(nn.Module):
         """Store a hidden state + its true label."""
         key = F.normalize(self.proj(hidden.detach()), dim=-1)  # (1, embed_dim)
         idx = int(self.ptr.item())
-        self.keys[idx] = key.squeeze(0)
+
+        self.keys = self.keys.clone()
+        self.keys[idx] = key.squeeze(0).detach()
         self.vals[idx] = label
         self.ptr = (self.ptr + 1) % self.capacity
         self.filled = min(self.filled + 1, torch.tensor(self.capacity))
@@ -238,7 +240,7 @@ class EpisodicMemory(nn.Module):
             ctx = torch.zeros(self.embed_dim, device=hidden.device)
             dist = torch.zeros(4, device=hidden.device)
             return ctx, dist
-        query = F.normalize(self.proj(hidden.detach()), dim=-1).squeeze(0)  # (embed_dim,)
+        query = F.normalize(self.proj(hidden), dim=-1).squeeze(0)  # (embed_dim,)
         sims = torch.matmul(self.keys[:n], query)  # (n,)
         k_eff = min(k, n)
         top_idx = torch.topk(sims, k_eff).indices   # (k_eff,)
@@ -440,7 +442,7 @@ def run_episode(agent, env: SignalEnvironment, optimizer: optim.Optimizer,
     # REINFORCE update
     if train and sum(abs(r) for r in rewards) > 1e-8:
         returns = compute_returns(rewards, cfg.gamma)
-        returns_t = torch.FloatTensor(returns).to(DEVICE)
+        returns_t = torch.FloatTensor(returns).to(DEVICE).detach()
         # Normalize returns
         if returns_t.std() > 1e-8:
             returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
@@ -507,7 +509,7 @@ def train_config(config_name: str, seed: int, cfg: ExperimentConfig,
 
         # Save checkpoint
         if (ep + 1) % cfg.checkpoint_every == 0 or ep == cfg.n_episodes - 1:
-            ckpt_path = f"/content/checkpoints/config{config_name}_seed{seed}_ep{ep+1}.pt"
+            ckpt_path = f"./checkpoints/config{config_name}_seed{seed}_ep{ep+1}.pt"
             torch.save({
                 "episode": ep + 1,
                 "seed": seed,
@@ -589,7 +591,7 @@ for metric in metrics_to_test:
         "E_mean": float(e_vals.mean()), "E_std": float(e_vals.std()),
         "t_stat": float(t_stat), "p_val": float(p_val),
         "cohens_d": float(d_effect),
-        "significant": p_val < 0.05
+        "significant": bool(p_val < 0.05)
     }
 
     sig = "*** p<0.05 ***" if p_val < 0.05 else "ns"
@@ -599,10 +601,10 @@ for metric in metrics_to_test:
     print(f"  Welch t={t_stat:.3f}, p={p_val:.4f}  Cohen's d={d_effect:.3f}  {sig}")
 
 # Save stats
-with open("/content/results/statistical_analysis.json", "w") as f:
+with open("./results/statistical_analysis.json", "w") as f:
     json.dump(stat_results, f, indent=2)
 
-print("\nStats saved to /content/results/statistical_analysis.json")
+print("\nStats saved to ./results/statistical_analysis.json")
 
 # Primary success check
 prec_stat = stat_results["precursor_det_rate"]
@@ -658,10 +660,10 @@ for config_name in ["D", "E"]:
               " surprised by precursors. Investigate ENV_CFG.precursor_mean_shift or extend episodes.")
 
 # Save traces
-with open("/content/surprise_traces_phase2.json", "w") as f:
+with open("./surprise_traces_phase2.json", "w") as f:
     json.dump(surprise_traces_output, f, indent=2)
 
-print("\nSurprise traces saved to /content/surprise_traces_phase2.json")
+print("\nSurprise traces saved to ./surprise_traces_phase2.json")
 print(">>> DOWNLOAD THIS FILE before ending your Colab session <<<")
 
 # %% ─── CELL 9 — LINEAR PROBE (Does D encode state structure?) ───────────────
@@ -697,7 +699,7 @@ for config_name in ["D", "E"]:
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
 
-        clf = LogisticRegression(max_iter=1000, C=1.0, multi_class='multinomial',
+        clf = LogisticRegression(max_iter=1000, C=1.0,
                                   solver='lbfgs', class_weight='balanced')
         clf.fit(X_train, y_train)
         acc = accuracy_score(y_test, clf.predict(X_test))
@@ -718,7 +720,7 @@ for config_name in ["D", "E"]:
     elif mean_acc <= 0.25:
         print(f"  [FAILURE] Config {config_name} at chance. Extend to 200+ ep before probing.")
 
-with open("/content/results/probe_results.json", "w") as f:
+with open("./results/probe_results.json", "w") as f:
     json.dump(probe_results, f, indent=2)
 
 # %% ─── CELL 10 — t-SNE VISUALIZATION ────────────────────────────────────────
@@ -750,7 +752,7 @@ for ax_idx, config_name in enumerate(["D", "E"]):
     H_scaled = scaler.fit_transform(H)
 
     print(f"  Running t-SNE for Config {config_name} ({n_vis} samples)...")
-    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42, verbose=0)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=seed, verbose=0)
     H_2d = tsne.fit_transform(H_scaled)
 
     ax = axes[ax_idx]
@@ -766,9 +768,9 @@ for ax_idx, config_name in enumerate(["D", "E"]):
     ax.set_ylabel("t-SNE dim 2")
 
 plt.tight_layout()
-plt.savefig("/content/plots/tsne_hidden_states.png", dpi=150, bbox_inches='tight')
+plt.savefig("./plots/tsne_hidden_states.png", dpi=150, bbox_inches='tight')
 plt.close()
-print("t-SNE plot saved to /content/plots/tsne_hidden_states.png")
+print("t-SNE plot saved to ./plots/tsne_hidden_states.png")
 
 # %% ─── CELL 11 — LEARNING CURVES PLOT ───────────────────────────────────────
 
@@ -810,9 +812,9 @@ for metric, title, ax in plot_metrics:
     ax.grid(alpha=0.3)
 
 plt.tight_layout()
-plt.savefig("/content/plots/learning_curves_phase2.png", dpi=150, bbox_inches='tight')
+plt.savefig("./plots/learning_curves_phase2.png", dpi=150, bbox_inches='tight')
 plt.close()
-print("Learning curves saved to /content/plots/learning_curves_phase2.png")
+print("Learning curves saved to ./plots/learning_curves_phase2.png")
 
 # %% ─── CELL 12 — SURPRISE COMPOSITION BAR CHART ─────────────────────────────
 
@@ -841,9 +843,9 @@ for ax_idx, config_name in enumerate(["D", "E"]):
         axes[ax_idx].text(i, pct + 1, f"{pct:.1f}%", ha='center', fontsize=10)
 
 plt.tight_layout()
-plt.savefig("/content/plots/surprise_composition.png", dpi=150, bbox_inches='tight')
+plt.savefig("./plots/surprise_composition.png", dpi=150, bbox_inches='tight')
 plt.close()
-print("Surprise composition chart saved to /content/plots/surprise_composition.png")
+print("Surprise composition chart saved to ./plots/surprise_composition.png")
 
 # %% ─── CELL 13 — SUMMARY & DOWNLOAD CHECKLIST ───────────────────────────────
 
@@ -861,10 +863,10 @@ for config_name, res in probe_results.items():
     print(f"  Config {config_name}: mean accuracy = {res['mean_acc']:.3f} (chance = 0.25)")
 
 print("\nFiles to download before session ends:")
-print("  /content/surprise_traces_phase2.json  ← REQUIRED for Phase 3")
-print("  /content/checkpoints/                 ← model weights")
-print("  /content/plots/                       ← all visualizations")
-print("  /content/results/                     ← statistical outputs")
+print("  ./surprise_traces_phase2.json  ← REQUIRED for Phase 3")
+print("  ./checkpoints/                 ← model weights")
+print("  ./plots/                       ← all visualizations")
+print("  ./results/                     ← statistical outputs")
 
 print("\nPhase 2 success criteria check:")
 prec_p = stat_results["precursor_det_rate"]["p_val"]
