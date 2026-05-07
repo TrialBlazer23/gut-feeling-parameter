@@ -35,6 +35,8 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 # ---------------------------------------------------------------------------
@@ -564,9 +566,9 @@ def run_episode_A(agent: ConfigA_Agent, env: SignalEnvironment, train: bool = Tr
 
     return {
         "ward_health": env.ward_health,
-        "prec_det": float(np.mean(metrics["prec_det"])) if metrics["prec_det"] else 0.0,
-        "threat_det": float(np.mean(metrics["threat_det"])) if metrics["threat_det"] else 0.0,
-        "fp": float(np.mean(metrics["fp"])) if metrics["fp"] else 0.0,
+        "prec_det": float(sum(metrics["prec_det"]) / len(metrics["prec_det"])) if metrics["prec_det"] else 0.0,
+        "threat_det": float(sum(metrics["threat_det"]) / len(metrics["threat_det"])) if metrics["threat_det"] else 0.0,
+        "fp": float(sum(metrics["fp"]) / len(metrics["fp"])) if metrics["fp"] else 0.0,
     }
 
 
@@ -613,9 +615,9 @@ def run_episode_BC(agent: ConfigB_Agent, env: SignalEnvironment, train: bool = T
 
     return {
         "ward_health": env.ward_health,
-        "prec_det": float(np.mean(metrics["prec_det"])) if metrics["prec_det"] else 0.0,
-        "threat_det": float(np.mean(metrics["threat_det"])) if metrics["threat_det"] else 0.0,
-        "fp": float(np.mean(metrics["fp"])) if metrics["fp"] else 0.0,
+        "prec_det": float(sum(metrics["prec_det"]) / len(metrics["prec_det"])) if metrics["prec_det"] else 0.0,
+        "threat_det": float(sum(metrics["threat_det"]) / len(metrics["threat_det"])) if metrics["threat_det"] else 0.0,
+        "fp": float(sum(metrics["fp"]) / len(metrics["fp"])) if metrics["fp"] else 0.0,
     }
 
 
@@ -644,9 +646,9 @@ def run_episode_D(agent: ConfigD_Agent, env: SignalEnvironment, train: bool = Tr
 
     return {
         "ward_health": env.ward_health,
-        "prec_det": float(np.mean(metrics["prec_det"])) if metrics["prec_det"] else 0.0,
-        "threat_det": float(np.mean(metrics["threat_det"])) if metrics["threat_det"] else 0.0,
-        "fp": float(np.mean(metrics["fp"])) if metrics["fp"] else 0.0,
+        "prec_det": float(sum(metrics["prec_det"]) / len(metrics["prec_det"])) if metrics["prec_det"] else 0.0,
+        "threat_det": float(sum(metrics["threat_det"]) / len(metrics["threat_det"])) if metrics["threat_det"] else 0.0,
+        "fp": float(sum(metrics["fp"]) / len(metrics["fp"])) if metrics["fp"] else 0.0,
     }
 
 
@@ -702,8 +704,8 @@ def run_experiment():
 
                 if (ep + 1) % 10 == 0:
                     recent = episode_metrics[-10:]
-                    avg_prec = np.mean([m["prec_det"] for m in recent])
-                    avg_ward = np.mean([m["ward_health"] for m in recent])
+                    avg_prec = sum(m["prec_det"] for m in recent) / len(recent)
+                    avg_ward = sum(m["ward_health"] for m in recent) / len(recent)
                     print(
                         f"    ep {ep+1:3d} | ward={avg_ward:6.1f} | "
                         f"prec_det={avg_prec:.3f}"
@@ -712,10 +714,10 @@ def run_experiment():
             # Aggregate last 10 episodes (or all if fewer)
             last_n = episode_metrics[-10:]
             summary = {
-                "ward_health": float(np.mean([m["ward_health"] for m in last_n])),
-                "prec_det": float(np.mean([m["prec_det"] for m in last_n])),
-                "threat_det": float(np.mean([m["threat_det"] for m in last_n])),
-                "fp": float(np.mean([m["fp"] for m in last_n])),
+                "ward_health": float(sum(m["ward_health"] for m in last_n) / len(last_n)) if last_n else 0.0,
+                "prec_det": float(sum(m["prec_det"] for m in last_n) / len(last_n)) if last_n else 0.0,
+                "threat_det": float(sum(m["threat_det"] for m in last_n) / len(last_n)) if last_n else 0.0,
+                "fp": float(sum(m["fp"] for m in last_n) / len(last_n)) if last_n else 0.0,
                 "all_episodes": episode_metrics,
             }
             all_results[str(seed)][config_key] = summary
@@ -733,7 +735,7 @@ def run_experiment():
     for config_key, desc in config_names.items():
         seed_results = [all_results[str(s)][config_key] for s in seeds]
         avg = {
-            k: float(np.mean([r[k] for r in seed_results]))
+            k: float(sum(r[k] for r in seed_results) / len(seed_results))
             for k in ["ward_health", "prec_det", "threat_det", "fp"]
         }
         aggregated[config_key] = avg

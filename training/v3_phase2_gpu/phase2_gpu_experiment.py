@@ -11,7 +11,7 @@
 
 # %% ─── CELL 1 — INSTALLS & IMPORTS ─────────────────────────────────────────
 
-!pip install -q torch torchvision scikit-learn matplotlib seaborn scipy
+# !pip install -q torch torchvision scikit-learn matplotlib seaborn scipy
 
 import os
 import json
@@ -52,9 +52,9 @@ print(f"PyTorch: {torch.__version__}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-os.makedirs("/content/checkpoints", exist_ok=True)
-os.makedirs("/content/plots", exist_ok=True)
-os.makedirs("/content/results", exist_ok=True)
+os.makedirs("./checkpoints", exist_ok=True)
+os.makedirs("./plots", exist_ok=True)
+os.makedirs("./results", exist_ok=True)
 
 # %% ─── CELL 2 — ENVIRONMENT CONFIG ─────────────────────────────────────────
 
@@ -91,8 +91,6 @@ class ExperimentConfig:
     # Checkpoint / logging
     checkpoint_every: int = 50
     log_every: int = 10
-    n_eval_episodes: int = 20          # Eval episodes per seed for hypothesis-test metrics
-    eval_seed_offset: int = 1000       # Offset so eval RNG streams differ from training streams
 
 ENV_CFG = EnvironmentConfig()
 EXP_CFG = ExperimentConfig()
@@ -224,7 +222,9 @@ class EpisodicMemory(nn.Module):
         """Store a hidden state + its true label."""
         key = F.normalize(self.proj(hidden.detach()), dim=-1)  # (1, embed_dim)
         idx = int(self.ptr.item())
-        self.keys[idx] = key.squeeze(0)
+
+        self.keys = self.keys.clone()
+        self.keys[idx] = key.squeeze(0).detach()
         self.vals[idx] = label
         self.ptr = (self.ptr + 1) % self.capacity
         self.filled = min(self.filled + 1, torch.tensor(self.capacity))
@@ -240,7 +240,7 @@ class EpisodicMemory(nn.Module):
             ctx = torch.zeros(self.embed_dim, device=hidden.device)
             dist = torch.zeros(4, device=hidden.device)
             return ctx, dist
-        query = F.normalize(self.proj(hidden.detach()), dim=-1).squeeze(0)  # (embed_dim,)
+        query = F.normalize(self.proj(hidden), dim=-1).squeeze(0)  # (embed_dim,)
         sims = torch.matmul(self.keys[:n], query)  # (n,)
         k_eff = min(k, n)
         top_idx = torch.topk(sims, k_eff).indices   # (k_eff,)
@@ -257,7 +257,7 @@ class EpisodicMemory(nn.Module):
 class ConfigA_Agent(nn.Module):
     """
     Supervised Baseline.
-    Trained with cross-entropy loss where normal(0) → class 0 and threat(2) → class 1.
+    Trained with BCE loss on threat(2) / normal(0) labels.
     Precursor labels (1) are completely ignored (withheld).
     """
     def __init__(self, window_size: int, cfg: ExperimentConfig):
@@ -269,6 +269,7 @@ class ConfigA_Agent(nn.Module):
     def forward(self, obs: torch.Tensor):
         hidden, pred_next, logits = self.encoder(obs)
         return hidden, pred_next, logits
+
 
 class ConfigD_Agent(nn.Module):
     """
@@ -283,7 +284,7 @@ class ConfigD_Agent(nn.Module):
         self.cfg = cfg
         # Running stats for surprise normalization
         self.register_buffer('_err_mean', torch.tensor(0.0))
-        self.register_buffer('_err_M2', torch.tensor(0.0))
+        self.register_buffer('_err_var', torch.tensor(1.0))
         self.register_buffer('_err_count', torch.tensor(0.0))
 
     def _update_running_stats(self, err: float):
@@ -293,13 +294,13 @@ class ConfigD_Agent(nn.Module):
         delta = err - self._err_mean.item()
         self._err_mean += delta / n
         delta2 = err - self._err_mean.item()
-        self._err_M2 += delta * delta2
+        self._err_var += (delta * delta2 - self._err_var) / n
 
     def forward(self, obs: torch.Tensor):
         hidden, pred_next, logits = self.encoder(obs)
         return hidden, pred_next, logits
 
-    def compute_intrinsic_reward(self, pred_next: torch.Tensor, actual_next: float, action: int) -> Tuple[float, float, bool]:
+    def compute_intrinsic_reward(self, pred_next: torch.Tensor, actual_next: float, action: int) -> float:
         """
         reward = 0.5 * normalized_pred_error
         gated by: pred_error > running_mean + 1.0*std AND action == 1
@@ -307,8 +308,7 @@ class ConfigD_Agent(nn.Module):
         pred_err = abs(pred_next.item() - actual_next)
         self._update_running_stats(pred_err)
         mean = self._err_mean.item()
-        var = self._err_M2.item() / max(self._err_count.item() - 1, 1.0)
-        std = math.sqrt(max(var, 1e-8))
+        std = math.sqrt(max(self._err_var.item(), 1e-8))
         normalized = (pred_err - mean) / (std + 1e-8)
         threshold_exceeded = pred_err > (mean + self.cfg.surprise_gate_std_mult * std)
         if threshold_exceeded and action == 1:
@@ -335,7 +335,7 @@ class ConfigE_Agent(nn.Module):
             nn.Linear(cfg.hidden_size // 2, 2)
         )
         self.register_buffer('_err_mean', torch.tensor(0.0))
-        self.register_buffer('_err_M2', torch.tensor(0.0))
+        self.register_buffer('_err_var', torch.tensor(1.0))
         self.register_buffer('_err_count', torch.tensor(0.0))
 
     def _update_running_stats(self, err: float):
@@ -344,7 +344,7 @@ class ConfigE_Agent(nn.Module):
         delta = err - self._err_mean.item()
         self._err_mean += delta / n
         delta2 = err - self._err_mean.item()
-        self._err_M2 += delta * delta2
+        self._err_var += (delta * delta2 - self._err_var) / n
 
     def forward(self, obs: torch.Tensor, write_label: Optional[int] = None):
         hidden, pred_next, _ = self.encoder(obs)
@@ -362,8 +362,7 @@ class ConfigE_Agent(nn.Module):
         pred_err = abs(pred_next.item() - actual_next)
         self._update_running_stats(pred_err)
         mean = self._err_mean.item()
-        var = self._err_M2.item() / max(self._err_count.item() - 1, 1.0)
-        std = math.sqrt(max(var, 1e-8))
+        std = math.sqrt(max(self._err_var.item(), 1e-8))
         normalized = (pred_err - mean) / (std + 1e-8)
         threshold_exceeded = pred_err > (mean + self.cfg.surprise_gate_std_mult * std)
         if threshold_exceeded and action == 1:
@@ -381,13 +380,11 @@ def compute_returns(rewards: List[float], gamma: float) -> List[float]:
     return returns
 
 
-def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimizer],
-                cfg: ExperimentConfig, config_name: str, train: bool = True,
-                collect_diagnostics: bool = True) -> Dict:
+def run_episode(agent, env: SignalEnvironment, optimizer: optim.Optimizer,
+                cfg: ExperimentConfig, config_name: str, train: bool = True) -> Dict:
     """
     Run one episode. Returns metrics dict.
     Handles ConfigA, ConfigD, and ConfigE agents polymorphically.
-    collect_diagnostics=False skips per-step trace capture to reduce memory use.
     """
     obs, labels = env.reset()
     is_config_e = isinstance(agent, ConfigE_Agent)
@@ -395,7 +392,6 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
     log_probs, rewards, pred_errors = [], [], []
     a_losses = []
     surprise_events = []  # (step_idx, pred_error, true_label, action)
-    surprise_count = 0
     action_counts = {0: 0, 1: 0}
     precursor_detected = 0
     precursor_total = 0
@@ -403,9 +399,6 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
     threat_total = 0
     all_hidden_states = []
     all_true_labels = []
-    if is_config_a and train:
-        target_normal = torch.tensor([0], dtype=torch.long, device=DEVICE)
-        target_threat = torch.tensor([1], dtype=torch.long, device=DEVICE)
     step = 0
 
     while True:
@@ -430,12 +423,10 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
         action_counts[action_val] += 1
 
         # Store hidden state for linear probe
-        if collect_diagnostics:
-            all_hidden_states.append(hidden.detach().cpu().squeeze(0).numpy())
+        all_hidden_states.append(hidden.detach().cpu().squeeze(0).numpy())
 
         next_obs, true_label, done = env.step(action_val)
-        if collect_diagnostics:
-            all_true_labels.append(int(true_label))
+        all_true_labels.append(int(true_label))
 
         # Track per-state-type detection
         if true_label == 1:
@@ -453,21 +444,19 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
             reward, pred_err, is_surprise = 0.0, 0.0, False
             if train:
                 if true_label == 0:
-                    a_losses.append(F.cross_entropy(logits, target_normal))
+                    a_losses.append(F.cross_entropy(logits, torch.tensor([0]).to(DEVICE)))
                 elif true_label == 2:
-                    a_losses.append(F.cross_entropy(logits, target_threat))
+                    a_losses.append(F.cross_entropy(logits, torch.tensor([1]).to(DEVICE)))
         else:
             reward, pred_err, is_surprise = agent.compute_intrinsic_reward(pred_next, actual_next, action_val)
 
         if is_surprise:
-            surprise_count += 1
-            if collect_diagnostics:
-                surprise_events.append({
-                    "step": step,
-                    "pred_error": float(pred_err),
-                    "true_label": int(true_label),
-                    "action": action_val
-                })
+            surprise_events.append({
+                "step": step,
+                "pred_error": float(pred_err),
+                "true_label": int(true_label),
+                "action": action_val
+            })
 
         # Write to Config E memory after step
         if is_config_e:
@@ -496,7 +485,7 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
             # REINFORCE update
             if sum(abs(r) for r in rewards) > 1e-8:
                 returns = compute_returns(rewards, cfg.gamma)
-                returns_t = torch.FloatTensor(returns).to(DEVICE)
+                returns_t = torch.FloatTensor(returns).to(DEVICE).detach()
                 # Normalize returns
                 if returns_t.std() > 1e-8:
                     returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
@@ -512,19 +501,19 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
     mean_err = float(np.mean(pred_errors)) if pred_errors else 0.0
     precursor_det_rate = precursor_detected / max(precursor_total, 1)
     threat_det_rate = threat_detected / max(threat_total, 1)
-    surprise_rate = surprise_count / max(step, 1)
+    surprise_rate = len(surprise_events) / max(step, 1)
     nonzero_reward_rate = sum(1 for r in rewards if r > 0) / max(step, 1)
 
-    # Cast scalars/lists for JSON serialization in result artifacts.
     return {
         "config": config_name,
-        "precursor_det_rate": float(precursor_det_rate),
-        "threat_det_rate": float(threat_det_rate),
-        "surprise_rate": float(surprise_rate),
-        "mean_pred_error": float(mean_err),
-        "nonzero_reward_rate": float(nonzero_reward_rate),
-        "action_rate": float(action_counts[1] / max(step, 1)),
-        "n_surprise_events": int(surprise_count),
+        "precursor_det_rate": precursor_det_rate,
+        "threat_det_rate": threat_det_rate,
+        "surprise_rate": surprise_rate,
+        "precursor_base_rate": precursor_total / max(step, 1),
+        "mean_pred_error": mean_err,
+        "nonzero_reward_rate": nonzero_reward_rate,
+        "action_rate": action_counts[1] / max(step, 1),
+        "n_surprise_events": len(surprise_events),
         "surprise_events": surprise_events,
         "hidden_states": all_hidden_states,
         "true_labels": all_true_labels,
@@ -532,8 +521,7 @@ def run_episode(agent, env: SignalEnvironment, optimizer: Optional[optim.Optimiz
 
 
 def train_config(config_name: str, seed: int, cfg: ExperimentConfig,
-                 env_cfg: EnvironmentConfig) -> Tuple[List[Dict], nn.Module, Dict, Dict]:
-    """Train one config/seed and return episode metrics, trained agent, final diagnostics, and eval summary."""
+                 env_cfg: EnvironmentConfig) -> List[Dict]:
     set_seed(seed)
     env = SignalEnvironment(env_cfg, seed=seed)
 
@@ -567,7 +555,7 @@ def train_config(config_name: str, seed: int, cfg: ExperimentConfig,
 
         # Save checkpoint
         if (ep + 1) % cfg.checkpoint_every == 0 or ep == cfg.n_episodes - 1:
-            ckpt_path = f"/content/checkpoints/config{config_name}_seed{seed}_ep{ep+1}.pt"
+            ckpt_path = f"./checkpoints/config{config_name}_seed{seed}_ep{ep+1}.pt"
             torch.save({
                 "episode": ep + 1,
                 "seed": seed,
@@ -582,25 +570,7 @@ def train_config(config_name: str, seed: int, cfg: ExperimentConfig,
     with torch.no_grad():
         final_metrics = run_episode(agent, env, optimizer, cfg, config_name, train=False)
 
-    eval_metrics = []
-    for eval_idx in range(cfg.n_eval_episodes):
-        eval_env = SignalEnvironment(env_cfg, seed=seed + cfg.eval_seed_offset + eval_idx)
-        with torch.no_grad():
-            eval_metrics.append(
-                run_episode(
-                    agent, eval_env, None, cfg, config_name,
-                    train=False, collect_diagnostics=False
-                )
-            )
-
-    eval_summary = {}
-    for metric in ["precursor_det_rate", "threat_det_rate", "surprise_rate", "nonzero_reward_rate"]:
-        eval_summary[metric] = float(np.mean([m[metric] for m in eval_metrics]))
-
-    # Clean up optimizer here before deleting agent in the main loop
-    del optimizer
-
-    return episode_metrics, agent, final_metrics, eval_summary
+    return episode_metrics, agent, final_metrics
 
 
 print("Training functions defined.")
@@ -613,8 +583,8 @@ print(f"Seeds: {EXP_CFG.n_seeds}  |  Episodes: {EXP_CFG.n_episodes}  |  Hidden: 
 print("=" * 60)
 
 all_results = {"A": {}, "D": {}, "E": {}}
+final_agents = {"A": {}, "D": {}, "E": {}}
 final_metrics_all = {"A": {}, "D": {}, "E": {}}
-eval_metrics_all = {"A": {}, "D": {}, "E": {}}
 
 for config_name in ["A", "D", "E"]:
     print(f"\n{'─'*40}")
@@ -623,21 +593,13 @@ for config_name in ["A", "D", "E"]:
     for seed in EXP_CFG.n_seeds:
         print(f"\n  Seed {seed}:")
         t0 = time.time()
-        ep_metrics, agent, fin_metrics, eval_metrics = train_config(config_name, seed, EXP_CFG, ENV_CFG)
+        ep_metrics, agent, fin_metrics = train_config(config_name, seed, EXP_CFG, ENV_CFG)
         elapsed = time.time() - t0
         all_results[config_name][seed] = ep_metrics
+        final_agents[config_name][seed] = agent
         final_metrics_all[config_name][seed] = fin_metrics
-        eval_metrics_all[config_name][seed] = eval_metrics
         print(f"  Seed {seed} complete in {elapsed:.1f}s | "
               f"final prec_det={ep_metrics[-1]['precursor_det_rate']:.3f}")
-
-        # Explicit VRAM memory management
-        # We don't need to save the full agent in memory because we have checkpoints.
-        # So we delete agent and optimizer here. But we need to keep fin_metrics
-        # (which has hidden states) for linear probe.
-        del agent
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 print("\nAll training complete.")
 
@@ -698,6 +660,7 @@ with open("/content/results/random_baseline.json", "w") as f:
         "mean_action_rate": float(mean_rand_act)
     }, f, indent=2)
 
+
 # %% ─── CELL 7 — STATISTICAL ANALYSIS (Welch t-test + Cohen's d) ─────────────
 
 print("\n" + "=" * 60)
@@ -710,13 +673,20 @@ def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
     return (a.mean() - b.mean()) / (pooled_std + 1e-10)
 
 
+def get_final_n_ep_mean(results: Dict, config: str, seed: int, metric: str, n: int = 20) -> float:
+    """Mean of last n episodes for a given metric."""
+    eps = results[config][seed]
+    vals = [e[metric] for e in eps[-n:]]
+    return float(np.mean(vals))
+
+
 metrics_to_test = ["precursor_det_rate", "threat_det_rate", "surprise_rate", "nonzero_reward_rate"]
 stat_results = {}
 
 for metric in metrics_to_test:
-    a_vals = np.array([eval_metrics_all["A"][s][metric] for s in EXP_CFG.n_seeds])
-    d_vals = np.array([eval_metrics_all["D"][s][metric] for s in EXP_CFG.n_seeds])
-    e_vals = np.array([eval_metrics_all["E"][s][metric] for s in EXP_CFG.n_seeds])
+    a_vals = np.array([get_final_n_ep_mean(all_results, "A", s, metric) for s in EXP_CFG.n_seeds])
+    d_vals = np.array([get_final_n_ep_mean(all_results, "D", s, metric) for s in EXP_CFG.n_seeds])
+    e_vals = np.array([get_final_n_ep_mean(all_results, "E", s, metric) for s in EXP_CFG.n_seeds])
 
     # Primary comparison: D vs A (Hypothesis 1)
     t_stat_DA, p_val_DA = stats.ttest_ind(d_vals, a_vals, equal_var=False)
@@ -732,10 +702,10 @@ for metric in metrics_to_test:
         "E_mean": float(e_vals.mean()), "E_std": float(e_vals.std()),
         "t_stat_DA": float(t_stat_DA), "p_val_DA": float(p_val_DA),
         "cohens_d_DA": float(d_effect_DA),
-        "significant_DA": p_val_DA < 0.05,
+        "significant_DA": bool(p_val_DA < 0.05),
         "t_stat_ED": float(t_stat_ED), "p_val_ED": float(p_val_ED),
         "cohens_d_ED": float(d_effect_ED),
-        "significant_ED": p_val_ED < 0.05
+        "significant_ED": bool(p_val_ED < 0.05)
     }
 
     sig_DA = "*** p<0.05 ***" if p_val_DA < 0.05 else "ns"
@@ -750,10 +720,10 @@ for metric in metrics_to_test:
     print(f"  [E vs D] Welch t={t_stat_ED:.3f}, p={p_val_ED:.4f}  Cohen's d={d_effect_ED:.3f}  {sig_ED}")
 
 # Save stats
-with open("/content/results/statistical_analysis.json", "w") as f:
+with open("./results/statistical_analysis.json", "w") as f:
     json.dump(stat_results, f, indent=2)
 
-print("\nStats saved to /content/results/statistical_analysis.json")
+print("\nStats saved to ./results/statistical_analysis.json")
 
 # Primary success check
 prec_stat = stat_results["precursor_det_rate"]
@@ -814,10 +784,10 @@ for config_name in ["D", "E"]:
               " surprised by precursors. Investigate ENV_CFG.precursor_mean_shift or extend episodes.")
 
 # Save traces
-with open("/content/surprise_traces_phase2.json", "w") as f:
+with open("./surprise_traces_phase2.json", "w") as f:
     json.dump(surprise_traces_output, f, indent=2)
 
-print("\nSurprise traces saved to /content/surprise_traces_phase2.json")
+print("\nSurprise traces saved to ./surprise_traces_phase2.json")
 print(">>> DOWNLOAD THIS FILE before ending your Colab session <<<")
 
 # %% ─── CELL 9 — LINEAR PROBE (Does D encode state structure?) ───────────────
@@ -831,7 +801,7 @@ probe_results = {}
 for config_name in ["D", "E"]:
     config_accs = []
     for seed in EXP_CFG.n_seeds:
-        # Re-load agent to get properties if needed, but linear probe doesn't need the agent
+        agent = final_agents[config_name][seed]
         fin = final_metrics_all[config_name][seed]
         hidden_states = np.array(fin["hidden_states"])   # (T, hidden_size)
         true_labels = np.array(fin["true_labels"])        # (T,)
@@ -853,7 +823,7 @@ for config_name in ["D", "E"]:
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
 
-        clf = LogisticRegression(max_iter=1000, C=1.0, multi_class='multinomial',
+        clf = LogisticRegression(max_iter=1000, C=1.0,
                                   solver='lbfgs', class_weight='balanced')
         clf.fit(X_train, y_train)
         acc = accuracy_score(y_test, clf.predict(X_test))
@@ -874,7 +844,7 @@ for config_name in ["D", "E"]:
     elif mean_acc <= 0.25:
         print(f"  [FAILURE] Config {config_name} at chance. Extend to 200+ ep before probing.")
 
-with open("/content/results/probe_results.json", "w") as f:
+with open("./results/probe_results.json", "w") as f:
     json.dump(probe_results, f, indent=2)
 
 # %% ─── CELL 10 — t-SNE VISUALIZATION ────────────────────────────────────────
@@ -906,7 +876,7 @@ for ax_idx, config_name in enumerate(["D", "E"]):
     H_scaled = scaler.fit_transform(H)
 
     print(f"  Running t-SNE for Config {config_name} ({n_vis} samples)...")
-    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42, verbose=0)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=seed, verbose=0)
     H_2d = tsne.fit_transform(H_scaled)
 
     ax = axes[ax_idx]
@@ -922,9 +892,9 @@ for ax_idx, config_name in enumerate(["D", "E"]):
     ax.set_ylabel("t-SNE dim 2")
 
 plt.tight_layout()
-plt.savefig("/content/plots/tsne_hidden_states.png", dpi=150, bbox_inches='tight')
+plt.savefig("./plots/tsne_hidden_states.png", dpi=150, bbox_inches='tight')
 plt.close()
-print("t-SNE plot saved to /content/plots/tsne_hidden_states.png")
+print("t-SNE plot saved to ./plots/tsne_hidden_states.png")
 
 # %% ─── CELL 11 — LEARNING CURVES PLOT ───────────────────────────────────────
 
@@ -966,9 +936,9 @@ for metric, title, ax in plot_metrics:
     ax.grid(alpha=0.3)
 
 plt.tight_layout()
-plt.savefig("/content/plots/learning_curves_phase2.png", dpi=150, bbox_inches='tight')
+plt.savefig("./plots/learning_curves_phase2.png", dpi=150, bbox_inches='tight')
 plt.close()
-print("Learning curves saved to /content/plots/learning_curves_phase2.png")
+print("Learning curves saved to ./plots/learning_curves_phase2.png")
 
 # %% ─── CELL 12 — SURPRISE COMPOSITION BAR CHART ─────────────────────────────
 
@@ -997,9 +967,9 @@ for ax_idx, config_name in enumerate(["D", "E"]):
         axes[ax_idx].text(i, pct + 1, f"{pct:.1f}%", ha='center', fontsize=10)
 
 plt.tight_layout()
-plt.savefig("/content/plots/surprise_composition.png", dpi=150, bbox_inches='tight')
+plt.savefig("./plots/surprise_composition.png", dpi=150, bbox_inches='tight')
 plt.close()
-print("Surprise composition chart saved to /content/plots/surprise_composition.png")
+print("Surprise composition chart saved to ./plots/surprise_composition.png")
 
 # %% ─── CELL 13 — SUMMARY & DOWNLOAD CHECKLIST ───────────────────────────────
 
@@ -1009,22 +979,21 @@ print("=" * 60)
 
 print("\nStatistical Results:")
 for metric, res in stat_results.items():
-    sig_da = "SIGNIFICANT" if res["significant_DA"] else "not significant"
-    sig_ed = "SIGNIFICANT" if res["significant_ED"] else "not significant"
-    print(f"  {metric}: D vs A p={res['p_val_DA']:.4f} ({sig_da}) | E vs D p={res['p_val_ED']:.4f} ({sig_ed})")
+    sig_str = "SIGNIFICANT" if res["significant"] else "not significant"
+    print(f"  {metric}: D={res['D_mean']:.4f} E={res['E_mean']:.4f}  p={res['p_val']:.4f} ({sig_str})")
 
 print("\nLinear Probe Results:")
 for config_name, res in probe_results.items():
     print(f"  Config {config_name}: mean accuracy = {res['mean_acc']:.3f} (chance = 0.25)")
 
 print("\nFiles to download before session ends:")
-print("  /content/surprise_traces_phase2.json  ← REQUIRED for Phase 3")
-print("  /content/checkpoints/                 ← model weights")
-print("  /content/plots/                       ← all visualizations")
-print("  /content/results/                     ← statistical outputs")
+print("  ./surprise_traces_phase2.json  ← REQUIRED for Phase 3")
+print("  ./checkpoints/                 ← model weights")
+print("  ./plots/                       ← all visualizations")
+print("  ./results/                     ← statistical outputs")
 
 print("\nPhase 2 success criteria check:")
-prec_p = stat_results["precursor_det_rate"]["p_val_ED"]
+prec_p = stat_results["precursor_det_rate"]["p_val"]
 prec_e_mean = stat_results["precursor_det_rate"]["E_mean"]
 prec_d_mean = stat_results["precursor_det_rate"]["D_mean"]
 probe_d_acc = probe_results["D"]["mean_acc"]
